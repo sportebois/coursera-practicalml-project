@@ -1,0 +1,270 @@
+---
+title: "Practical Machine Learning - Prediction Assignment"
+author: "Sébastien Portebois"
+date: "September 2015"
+output: html_document
+---
+
+# Executive summary
+
+How well a physical exercise is performed.through the analysis of data collected from accelerometers on the belt, forearm, arm, and dumbell. We will explain how we train our model, how we clean our data and select the relevant features, then how we evaluate the out of sample error we expect to get from real data, after a 3 times repeated 10-fold cross validation training. 
+
+A few R packages will be used, for loading the data, parsing and cleaning it, then training our model and computing our predictions, and plot our results. 
+All the code and package linkage is exposed in the source code, that you can see [here](). **FIXME add link**
+
+
+```{r Package definition basic config, warning=FALSE, message=FALSE}
+library(knitr)
+library(devtools)
+library(caret)
+library(scales)
+library(ggthemr) #from devtools::install_github('cttobin/ggthemr')
+library(doParallel)
+registerDoParallel(cores=2)
+library(readr)
+library(stringr)
+library(dplyr)
+
+set.seed(1234)
+```
+
+We load the data from the csv files, and by forcing the types of the column. We force the `new_window` types to factors with yes/no values, `num_window` to integer, and all the arm/forearm/dumbbell/belt measures to double. For the training dataset, the `classe` observation is cast to an ordered factor with the A,B,C,D,E values. And finally we clean the NA-like values, for instance the `#DIV/0!` entries, to get real NAs values.
+
+
+```{r Loading data, echo=FALSE}
+# Replace `#DIV/0!` by NA
+swapFile <- tempfile(fileext = ".csv")
+
+col_types <- list(new_window = readr::col_factor(c("no", "yes")), 
+                  num_window = col_integer(),
+                  roll_arm                = col_double(), # arm
+                  yaw_arm                 = col_double(),
+                  var_accel_arm           = col_double(),
+                  avg_roll_arm            = col_double(),
+                  stddev_roll_arm         = col_double(),
+                  var_roll_arm            = col_double(),
+                  avg_pitch_arm           = col_double(),
+                  stddev_pitch_arm        = col_double(),
+                  var_pitch_arm           = col_double(),
+                  avg_yaw_arm             = col_double(),
+                  stddev_yaw_arm          = col_double(),
+                  var_yaw_arm             = col_double(),
+                  max_roll_arm            = col_double(),
+                  max_picth_arm           = col_double(),
+                  max_yaw_arm             = col_double(),
+                  min_roll_arm            = col_double(),
+                  min_pitch_arm           = col_double(),
+                  min_yaw_arm             = col_double(),
+                  amplitude_roll_arm      = col_double(),
+                  amplitude_pitch_arm     = col_double(),
+                  amplitude_yaw_arm       = col_double(),
+                  kurtosis_roll_arm       = col_double(),
+                  kurtosis_picth_arm      = col_double(),
+                  kurtosis_yaw_arm        = col_double(),
+                  skewness_roll_arm       = col_double(),
+                  skewness_pitch_arm      = col_double(),
+                  skewness_yaw_arm        = col_double(),
+                  yaw_forearm             = col_double(), # forearm
+                  kurtosis_roll_forearm   = col_double(),
+                  var_accel_forearm       = col_double(),
+                  avg_roll_forearm        = col_double(),
+                  stddev_roll_forearm     = col_double(),
+                  var_roll_forearm        = col_double(),
+                  avg_pitch_forearm       = col_double(),
+                  stddev_pitch_forearm    = col_double(),
+                  var_pitch_forearm       = col_double(),
+                  avg_yaw_forearm         = col_double(),
+                  stddev_yaw_forearm      = col_double(),
+                  var_yaw_forearm         = col_double(),
+                  max_roll_forearm        = col_double(),
+                  max_picth_forearm       = col_double(),
+                  amplitude_roll_forearm  = col_double(),
+                  amplitude_pitch_forearm = col_double(),
+                  min_roll_forearm        = col_double(),
+                  min_pitch_forearm       = col_double(),
+                  magnet_forearm_x        = col_double(),
+                  magnet_forearm_y        = col_double(),
+                  magnet_forearm_z        = col_double(),
+                  var_total_accel_belt    = col_double(), # belt
+                  avg_roll_belt           = col_double(),
+                  stddev_roll_belt        = col_double(),
+                  var_roll_belt           = col_double(),
+                  avg_pitch_belt          = col_double(),
+                  stddev_pitch_belt       = col_double(),
+                  var_pitch_belt          = col_double(),
+                  avg_yaw_belt            = col_double(),
+                  stddev_yaw_belt         = col_double(),
+                  var_yaw_belt            = col_double(),
+                  kurtosis_picth_belt     = col_double(),
+                  skewness_roll_belt.1    = col_double(),
+                  skewness_yaw_belt       = col_double(),
+                  magnet_dumbbell_x       = col_double(),
+                  magnet_dumbbell_y       = col_double(),
+                  magnet_dumbbell_z       = col_double())
+
+loadCsv <- function (csvPath, train=FALSE) {
+    ttypes <- col_types
+    if (train) {
+        ttypes <- append(col_types, list(classe=col_factor(c("E", "D", "C", "B", "A"), ordered = TRUE)))
+    }
+    raw_csv <- readLines(csvPath, encoding="UTF-8")
+    raw_csv <- str_replace_all(raw_csv, "#DIV\\/0!", "")
+    writeLines(raw_csv, swapFile )
+    read_csv(swapFile, col_types = ttypes, na='NA')
+}
+
+
+raw.training <- loadCsv("pml-training.csv", train=TRUE)
+testing <- loadCsv("pml-testing.csv") 
+training <- raw.training
+
+# Exercice quality 'classe'
+training$classe <- factor(training$classe, ordered = TRUE, levels=c("E", "D", "C", "B", "A"))
+
+```
+
+
+# Data exploration and data cleaning
+
+After looking at the raw data, we quickly see that two different kind of observations are present. All the observations with `new_window==no` have missing data for most of the measures, and the pattern of missing data is reversed for the observations with new_window set to yes. It really looks like we have like 2 very different subset of data. 
+Obviously, the `new_window` flag is set to yes to setup initial values of the a new window recordset, then only some values are saved at interval until the end of this observation window. 
+We do have `r training %>% filter(new_window == "yes") %>% nrow()` observations with `new_window=yes` and `r training %>% filter(new_window != "yes") %>% nrow()` with `now_window=no`.  
+Because of the very very small size of the 'yes' sub-dataset, we will ignore this data and only focus on the 'no' sub-dataset to try to get more reliable predictions.
+
+
+```{r}
+training <- training %>% dplyr::filter(new_window != "yes")
+```
+
+There's a lot of NA in this dataset. So next step we will investigate for the variables that are mostly composed of NA and we will remove them to only keep the fields that contain data we could build a reliable model from.
+
+```{r Getting the NA-infested variables}
+na.info <- apply(training, 2, function(x) length(which(is.na(x))))
+unique((as.vector(na.info))) #Distinct count of NAs for each variables
+```
+
+As we can see, the variables are either only NAs, or contain some data. We will therefore remove the columns that are only composed of NAs.
+
+```{r Keep only variables that contain some data}
+columns.to.keep <- colnames(training)[as.vector(na.info) == 0]
+training <- training[, columns.to.keep]
+```
+
+
+Now that we have a cleaned data set, we will use the _recursive feature selection_ algorithm to compute the most relevant features, on which we will then build our model. This recursive model selection will be built from a 10-fold cross validation of the cleaned training data set. We will ask the algorithm to select only the 10 most effective features. Then we will plot the accuracy gained by adding these features to select which one we will use to train our model.
+
+
+# Features selection and cross validation
+
+```{r Build a first model to find the most relevant features}
+ 
+# Define the cross-validation control
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+
+# run the Recursive Feature Elimination (RFE) algorithm
+# new_window is useless, and user_name should not be a relevant predictor!
+training.data <- training %>% dplyr::select(-c(1, user_name, new_window)) 
+training.classe <- training.data$classe
+training.features <- training.data %>% dplyr::select(-c(1, cvtd_timestamp, classe, num_window))
+
+# Some caching to avoid repeated-training if we already have the model
+if (!exists("results")) {
+    results <- if (file.exists("rfeResults.RData"))
+        get(load("rfeResults.RData"))
+    else
+        rfe(training.features, training.classe, sizes=c(1:10), rfeControl=control)
+}
+
+# summarize the results
+print(results)
+
+
+# Display the list the more relevant features
+ggthemr('fresh')
+ggplot(results$results, aes(Variables, Accuracy)) + 
+    geom_point() + geom_line() + 
+    geom_hline(aes(yintercept = .95, color=0)) + 
+    ggtitle("Cumulative accuracy with 0.95 highlighted")
+```
+
+
+As we can see, using the 5 most useful features as predictors will already give us a high level of accuracy (around .97), so we will keep the number of predictors as low as 5 to avoid adding to much overfitting to our model, and we could even consider using only 4, which would gave us around .95 accuracy. As we used a 10 fold cross validation, we could think that our out-of-sample error would be a little bigger, or or accuracy a little bit lower. The K-fold cross validation used should prevent us from a too big gap between in-sample and out of sample error. 
+
+
+We will start creating a new Random Forest model, using these elected features
+```{r Train a RF model with only the few other features}
+# Train the model if it's not yet computed
+if (!exists("model.rf.5")) {
+    model.rf.5 <- if (file.exists("dump-model.rf.RData"))
+        get(load("dump-model.rf.RData"))
+    else
+        train(classe ~ roll_belt + yaw_belt + magnet_dumbbell_z + pitch_belt + magnet_dumbbell_y, method="rf", data=training.data)
+}
+```
+
+To compare the predictors, we will also train another random forest model, from a repeated cross-validation control function, using a 10 chunks k-fold splitting, repeated 3 times. With this 3 time repetition, the mean of the accuracy will be used, and the average model will be returned, not the best one. This should prevent us from overfitting to much and should give us an accuracy closer to the out-of-sample error we could have on real live data.
+
+
+```{r, Training a Ranfom Forest model from a 10-fold dataset repeated 3 times, message=FALSE}
+training.xvalFeatures <- training.data %>% dplyr::select(-c(1, cvtd_timestamp, num_window))
+# define training control
+cross.validated.control <- trainControl(method="repeatedcv", number=10, repeats=3)
+# train the model with the cross-validation set (if it's not yet computed)
+if (!exists("modelNBCrossValidated")) {
+    modelNBCrossValidated <- if (file.exists("dump-modelNBCrossValidated.RData")) {
+        get(load("dump-modelNBCrossValidated.RData"))
+    } else {
+        train(classe ~ ., data=training.xvalFeatures, method="rf", preprocess="scale", trControl=cross.validated.control)
+    }
+}
+```
+
+```{r, Features importance computation }
+# Estimate variable importance and display it
+importance <- varImp(modelNBCrossValidated, scale=FALSE)
+print(importance)
+```
+
+```{r, plot feature importance, echo=FALSE}
+plot(importance)
+```
+
+
+By now, we are ready to make predictions on the test set. We will compute these predictions twice, one time for each one of our trained models.
+
+```{r, Compute predictions}
+# make predictions
+predictions <- predict(modelNBCrossValidated, testing)
+predictions2 <- predict(model.rf.5, testing)
+
+# summarize results
+table(predictions, predictions2)
+```
+
+We can see that the predictions from both our models match. With so little data, we cannot already know if our model are correct, use the correct features and are not falling in the overfitting end. Given the nice accuracy from the cross-validation test we had, we can believe these models are ready to be used with more real data. 
+
+
+Finally, if the reader wants to compare our predictions with predictions he could have done from another model, here are the complete set of prediction comupted. The Coursera's validation page returned that all these predictions are correct.
+
+
+```{r, Display predictions, echo=FALSE}
+knitr::kable(data.frame(case=1:20, prediction=predictions))
+```
+
+
+```{r, Output predictions to file, echo=FALSE}
+
+# Save the files to submit the predictions into the grading platform
+pml_write_files <- function(x, suffix="xval") {
+    n = length(x)
+    for (i in 1:n) {
+        filename <- paste0("problem_id_", suffix, "_", i, ".txt")
+        write.table(x[i], file = filename, quote=FALSE, row.names = FALSE, col.names = FALSE)
+    }
+}
+pml_write_files(predictions)
+pml_write_files(predictions2, "rf")
+
+
+```
+
